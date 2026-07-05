@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: pdf-study-assistant
+    runtime: docker
+    region: oregon
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
+    buildFilter:
+      paths:
+        - source: /ui
+          ignore: false
+        - source: /app.py
+          ignore: false
+        - source: /requirements.txt
+          ignore: false

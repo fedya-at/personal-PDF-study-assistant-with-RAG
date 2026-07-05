@@ -1,0 +1,12 @@
+.venv
+venv
+__pycache__
+*.pyc
+.env
+.DS_Store
+node_modules
+dist
+.pytest_cache
+chroma_data
+chroma.sqlite3
+*.log
