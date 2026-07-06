@@ -12,11 +12,10 @@ from pdf_loader import load_pdf_pages
 from chunker import chunk_pages
 from embedder import Embedder
 from vector_store import VectorStore
-from rag_pipeline import answer_question
+from rag_pipeline import answer_question, condense_question
 
 app = FastAPI(title="Personal PDF Study Assistant")
 
-# Allow a local frontend (e.g. a React app on a different port) to call this API.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,11 +46,14 @@ documents: dict[str, dict] = {}
 
 
 # ---------- Request/response schemas ----------
-
+class ConversationTurn(BaseModel):
+    question: str
+    answer: str
 class AskRequest(BaseModel):
     question: str
     doc_id: str | None = None  # None = search across ALL uploaded documents
-    top_k: int = 4
+    top_k: int = 6
+    history:list[ConversationTurn] =[] # optional chat history for follow-up questions
 
 
 class Source(BaseModel):
@@ -83,13 +85,6 @@ def health():
 
 @app.post("/documents/upload", response_model=DocumentInfo)
 async def upload_document(file: UploadFile = File(...)):
-    """
-    Upload a PDF. It is:
-    1. Saved the file
-    2. Text-extracted page by page
-    3. Chunked (with overlap) and tagged with page number + chunk id
-    4. Embedded and added to a new FAISS index for this document
-    """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only .pdf files are supported.")
 
@@ -115,7 +110,8 @@ async def upload_document(file: UploadFile = File(...)):
     texts = [c["text"] for c in chunks]
     vectors = embedder.embed_texts(texts)
 
-    store = VectorStore(embedding_dim=vectors.shape[1])
+    """ in FAISS store = VectorStore(embedding_dim=vectors.shape[1])"""
+    store = VectorStore(collection_name=doc_id)
     store.add(vectors, chunks)
 
     documents[doc_id] = {
@@ -150,6 +146,8 @@ def list_documents():
 def delete_document(doc_id: str):
     if doc_id not in documents:
         raise HTTPException(status_code=404, detail="doc_id not found.")
+    """ This added with chromadb-backed vector store to delete the collection from disk """
+    documents[doc_id]["store"].delete_collection()
     del documents[doc_id]
     return {"status": "deleted", "doc_id": doc_id}
 
@@ -165,18 +163,22 @@ def ask(request: AskRequest):
     if not documents:
         raise HTTPException(status_code=400, detail="No documents uploaded yet.")
 
+      # Pydantic gives us ConversationTurn objects; the RAG functions just want
+    # plain {"question": ..., "answer": ...} dicts, so convert once here.
+    history = [turn.model_dump() for turn in request.history]
+
     if request.doc_id is not None:
         if request.doc_id not in documents:
             raise HTTPException(status_code=404, detail="doc_id not found.")
         store = documents[request.doc_id]["store"]
-        result = answer_question(request.question, embedder, store, top_k=request.top_k)
+        result = answer_question(request.question, embedder, store, top_k=request.top_k, history=history)
     else:
-        result = _ask_across_all_documents(request.question, top_k=request.top_k)
+        result = _ask_across_all_documents(request.question, top_k=request.top_k, history=history)
 
     return AskResponse(**result)
 
 
-def _ask_across_all_documents(question: str, top_k: int) -> dict:
+def _ask_across_all_documents(question: str, top_k: int, history: list[dict]) -> dict:
     """
     Multi-PDF reasoning: retrieve top_k chunks from EACH document separately
     (so one large PDF can't drown out the others), merge, keep the best
@@ -185,7 +187,9 @@ def _ask_across_all_documents(question: str, top_k: int) -> dict:
     from rag_pipeline import build_context_block, _build_sources, SYSTEM_PROMPT, OLLAMA_MODEL
     import ollama
 
-    query_vector = embedder.embed_query(question)
+    history = history or []
+    standalone_question = condense_question(question, history)
+    query_vector = embedder.embed_query(standalone_question)
 
     all_candidates = []
     for doc_id, info in documents.items():
@@ -206,13 +210,16 @@ Question: {question}
 
 Answer the question using only the excerpts above. Cite with bracketed excerpt
 numbers like [1], never with chunk ids or page numbers written out."""
+    
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for turn in history:
+        messages.append({"role": "user", "content": turn["question"]})
+        messages.append({"role": "assistant", "content": turn["answer"]})
+    messages.append({"role": "user", "content": user_prompt})
 
     response = ollama.chat(
         model=OLLAMA_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt}
-        ],
+        messages=messages,
         options={"temperature": 0}
     )
 
